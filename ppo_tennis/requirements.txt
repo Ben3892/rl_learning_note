@@ -1,0 +1,7 @@
+gymnasium[atari]>=1.0,<2
+ale-py>=0.10,<0.12
+stable-baselines3>=2.4,<3
+opencv-python>=4.8,<5
+tensorboard>=2.16,<3
+imageio>=2.34,<3
+imageio-ffmpeg>=0.5,<0.7
