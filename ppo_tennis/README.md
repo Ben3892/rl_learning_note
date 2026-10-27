@@ -1,5 +1,8 @@
 # PPO Tennis MVP
 
+新增：[带经验回放的 Q-learning / DQN 版本](DQN.md)，入口为 `dqn_tennis.py`，
+支持训练、原生奖励评估、视频导出和 CUDA，与 PPO 使用独立的模型与实验目录。
+
 先读 [最小 MVP 设计](MVP.md)，入口为 [tennis.py](tennis.py)，辅助奖励在
 [reward_shaping.py](reward_shaping.py)。
 使用 SB3 的 PPO 实现，适合先理解训练流程，再学习算法内部。
@@ -20,6 +23,50 @@ python tennis.py --help
 Atari 图像预处理需要 OpenCV，导出视频需要 imageio/FFmpeg。
 依赖文件限制主要版本范围，每次实验在 versions.json 记录实际核心依赖版本。
 若遇到 `No module named gymnasium`，先检查终端和 IDE 是否使用同一解释器。
+
+## 在 NVIDIA CUDA 机器运行
+
+把整个 `ppo_tennis/` 文件夹复制到有 NVIDIA GPU 的机器，使用相同的 Python 入口。
+网络的 CNN 前向计算和 PPO 反向传播在 GPU 上执行；Atari 模拟器、RAM 奖励检测、
+图像预处理以及 rollout buffer 仍在 CPU。当前 DummyVecEnv 在单进程中依次执行各环境，
+增加 n_envs 主要扩大推理批次，不会自动让模拟器多进程并行。
+
+先运行 `nvidia-smi` 检查驱动，再按
+[PyTorch 官方安装选择器](https://pytorch.org/get-started/locally/)
+选择目标系统、Pip 和适合驱动的 CUDA 构建，执行页面生成的安装命令。
+随后在同一环境安装本项目依赖并验证：
+
+```bash
+python -m pip install -r requirements.txt
+python -c "import torch; print('torch:', torch.__version__, 'CUDA build:', torch.version.cuda); assert torch.cuda.is_available(), 'PyTorch 无法使用 CUDA'; print(torch.cuda.get_device_name(0)); print(torch.ones(1, device='cuda'))"
+```
+
+先做一次 CUDA 冒烟，再启动正式训练（工作目录为 ppo_tennis）：
+
+```bash
+python tennis.py train --device cuda --run-dir runs/cuda_smoke --total-timesteps 1024
+python tennis.py train --device cuda:0 --run-dir runs/tennis_cuda_1m --total-timesteps 1000000
+python tennis.py evaluate --device cuda:0 --model runs/tennis_cuda_1m/best/best_model.zip --episodes 5 --output runs/tennis_cuda_1m/evaluation.json
+python tennis.py play --device cuda:0 --model runs/tennis_cuda_1m/best/best_model.zip --video runs/tennis_cuda_1m/demo.mp4
+```
+
+`--device cuda` 或 `cuda:N` 不可用时会直接报错，不会静默回退 CPU；
+`--device auto` 则在 CUDA 可用时选择 CUDA，否则选择 CPU。
+默认仍为 `cpu`，便于 Mac 本地调试。N 是进程可见设备编号：
+例如 `CUDA_VISIBLE_DEVICES=1` 后使用 `--device cuda:0`，实际对应物理 GPU 1。
+本实现使用单 GPU，不包含多 GPU 分布式训练。
+
+启动时打印实际设备与 GPU 名称，训练目录 `device.json` 记录请求设备、
+实际模型设备、PyTorch/CUDA 构建版本和 GPU 名称。
+CUDA 模型也可以复制回 Mac，用 `--device cpu` 进行评估和视频导出。
+
+先保持默认的 4 环境、batch 256 作为对照。若 GPU 利用率低，可试
+`--n-envs 8 --batch-size 512`（rollout=1024，可被 batch 整除），
+但这也改变训练批次设置，需同时观察原生评估回报和吞吐量；GPU 不保证总耗时更短。
+无图形桌面的服务器直接导出 MP4，不使用 `--human`。
+
+本地验证覆盖设备路由测试和 CPU 训练。当前开发机器没有 NVIDIA GPU，
+未实测 CUDA 内核执行、显存占用或加速比；上面的 CUDA 冒烟命令用于目标机器验收。
 
 ## 先验证流程
 
@@ -140,7 +187,8 @@ python tennis.py play --model runs/tennis_1m/best/best_model.zip --human --steps
 Tennis 每一分开始都需要 FIRE，模型可能学到不发球来避免失分，应同时检查录像和回报。
 窗口遇到显示问题时可先使用 MP4 导出。
 
-所有命令都支持 `--seed`、`--device` 和 `--threads`；具体参数见各子命令 `--help`。
+所有命令都支持 `--seed`、`--device`（cpu / cuda / cuda:N / auto）和 `--threads`；
+具体参数见各子命令 `--help`。
 
 ## 本次实际验证（2026-10-25）
 

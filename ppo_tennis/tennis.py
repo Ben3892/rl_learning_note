@@ -36,7 +36,7 @@ def write_json(path, data):
 
 
 def make_env(n_envs=1, seed=0, render_mode=None, monitor_dir=None,
-             shaping=False, reward_config=None):
+             shaping=False, reward_config=None, max_agent_steps=None):
     """Same image pipeline; training optionally adds auxiliary rewards."""
     def factory(rank):
         def create():
@@ -47,6 +47,8 @@ def make_env(n_envs=1, seed=0, render_mode=None, monitor_dir=None,
             tracker = TennisRAMTracker(env, reward_config or RewardConfig())
             env = AtariWrapper(tracker, frame_skip=4, terminal_on_life_loss=False,
                                clip_reward=False)
+            if max_agent_steps is not None:
+                env = gym.wrappers.TimeLimit(env, max_episode_steps=max_agent_steps)
             filename = None
             if monitor_dir is not None:
                 Path(monitor_dir).mkdir(parents=True, exist_ok=True)
@@ -131,13 +133,17 @@ def train(args):
         eval_env.close()
 
 
-def evaluate(args):
-    model = PPO.load(args.model, device=args.device)
+def evaluate(args, algorithm=PPO, label='ppo'):
+    model = algorithm.load(args.model, device=args.device)
     result = {"model": str(args.model.resolve()), "env_id": ENV_ID,
+              'algorithm': algorithm.__name__,
               "max_raw_steps": MAX_RAW_STEPS, "deterministic": True,
               "note": "原始累计奖励，不等于胜率；truncated 表示时间上限。"}
-    for label in ("random", "ppo"):
-        env = make_env()
+    max_steps = getattr(args, 'eval_max_steps', None)
+    result['max_agent_steps'] = max_steps
+    for policy_name in ("random", label):
+        env = make_env(max_agent_steps=max_steps,
+                       reward_config=model_reward_config(args.model))
         episodes = []
         try:
             for index in range(args.episodes):
@@ -145,22 +151,28 @@ def evaluate(args):
                 rng = np.random.default_rng(seed)
                 env.seed(seed)
                 obs = env.reset()
-                score, length = 0.0, 0
+                score, length, waiting, returns = 0.0, 0, 0, 0
+                print(f'{policy_name}: 开始评估 seed={seed}', flush=True)
                 while True:
-                    if label == "random":
+                    if policy_name == "random":
                         action = np.array([rng.integers(env.action_space.n)])
                     else:
                         action, _ = model.predict(obs, deterministic=True)
                     obs, rewards, dones, infos = env.step(action)
                     score += float(rewards[0])
                     length += 1
+                    waiting += int(infos[0]['tennis_state']['own_serve'])
+                    returns += int(infos[0]['reward_components']['return_count'])
+                    if length % 1000 == 0:
+                        print(f'{policy_name}: step={length}, raw_reward={score}', flush=True)
                     if dones[0]:
                         episodes.append({"seed": seed, "reward": score, "steps": length,
+                                         'own_serve_steps': waiting, 'returns': returns,
                                          "truncated": bool(infos[0].get("TimeLimit.truncated"))})
-                        print(f"{label}: seed={seed}, reward={score}, steps={length}")
+                        print(f"{policy_name}: seed={seed}, reward={score}, steps={length}", flush=True)
                         break
             scores = [episode["reward"] for episode in episodes]
-            result[label] = {"mean_reward": float(np.mean(scores)),
+            result[policy_name] = {"mean_reward": float(np.mean(scores)),
                              "std_reward": float(np.std(scores)), "episodes": episodes}
         finally:
             env.close()
@@ -168,10 +180,12 @@ def evaluate(args):
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def play(args):
+def play(args, algorithm=PPO):
     import imageio.v2 as imageio
 
-    model = PPO.load(args.model, device=args.device)
+    model = algorithm.load(args.model, device=args.device)
+    if algorithm.__name__ == 'DQN':
+        model.exploration_rate = args.epsilon
     reward_config = model_reward_config(args.model)
     env = make_env(seed=args.seed, render_mode="human" if args.human else "rgb_array",
                    reward_config=reward_config)
@@ -196,6 +210,8 @@ def play(args):
             reward_writer.writeheader()
             write_json(log_path.with_suffix('.config.json'),
                        dict(model=str(args.model.resolve()), seed=args.seed,
+                            algorithm=algorithm.__name__,
+                            epsilon=getattr(args, 'epsilon', None),
                             stochastic=args.stochastic, evaluation_uses_raw_reward=True,
                             reward_config=asdict(reward_config)))
         action_names = env.envs[0].unwrapped.get_action_meanings()

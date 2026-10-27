@@ -23,6 +23,8 @@ Stable-Baselines3 的 PPO 学习从图像选择动作，最终提供模型、评
 - 起始参数：4 个环境，rollout 128 步/环境，batch 256，4 epochs，
   learning rate 2.5e-4，gamma 0.99，GAE lambda 0.95，clip 0.1，entropy 0.01。
 - 默认 CPU；有 NVIDIA GPU 时可选 `--device cuda`。参数是起点，未经过 Tennis 调优。
+  支持 `cuda:N` 指定单卡；显式请求 CUDA 不可用时直接报错。
+  CUDA 加速 CNN/PPO 计算，环境与辅助奖励仍由 CPU 执行；运行步骤见 README。
 
 ## 3. 最小交付
 
@@ -33,6 +35,7 @@ Stable-Baselines3 的 PPO 学习从图像选择动作，最终提供模型、评
 | test_reward_shaping.py | 回击、等待、站位、换边等事件回归测试 |
 | requirements.txt | 运行依赖 |
 | runs/<名称>/config.json、versions.json | 参数、依赖版本 |
+| runs/<名称>/device.json | 实际模型设备、GPU 名称、PyTorch/CUDA 构建信息 |
 | runs/<名称>/reward_config.json | 辅助奖励开关、权重与检测器版本 |
 | runs/<名称>/final_model.zip | 最后一次训练模型 |
 | runs/<名称>/best/best_model.zip | 定期评估选出的模型（触发评估后才生成） |
