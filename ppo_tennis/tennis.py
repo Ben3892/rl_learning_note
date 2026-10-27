@@ -21,6 +21,7 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecTransposeImage
 
 from reward_shaping import RewardConfig, TennisRAMTracker, TennisRewardWrapper
+from device_utils import device_info, resolve_device
 
 gym.register_envs(ale_py)
 ROOT = Path(__file__).resolve().parent
@@ -108,6 +109,7 @@ def train(args):
             clip_range=0.1, ent_coef=0.01, seed=args.seed, device=args.device,
             verbose=1,
         )
+        write_json(run / 'device.json', device_info(args.requested_device, model.device))
         model.set_logger(configure(str(run), ["stdout", "csv", "tensorboard"]))
         callbacks = [
             RewardLoggingCallback(),
@@ -274,7 +276,8 @@ def main():
                    help='动作和奖励分项 CSV；视频模式默认保存到视频同名 .rewards.csv')
     for p in sub.choices.values():
         p.add_argument("--seed", type=int, default=20_000 if p.prog.endswith("evaluate") else 0)
-        p.add_argument("--device", default="cpu", help="cpu / cuda / auto")
+        p.add_argument("--device", default="cpu",
+                       help="cpu / cuda / cuda:N / auto；显式指定 CUDA 时不可回退 CPU")
         p.add_argument("--threads", type=positive, default=4)
     args = parser.parse_args()
     if args.command == "train":
@@ -283,6 +286,14 @@ def main():
             parser.error("n_envs * n_steps 必须 >= 2，且能被 batch_size（>=2）整除")
         if args.run_dir.exists():
             parser.error("run-dir 已存在，请使用一个新的实验目录")
+    args.requested_device = args.device
+    try:
+        args.device = resolve_device(args.device)
+    except (ValueError, RuntimeError) as error:
+        parser.error(str(error))
+    print(f'计算设备：{args.device}（请求：{args.requested_device}）', flush=True)
+    if args.device.startswith('cuda'):
+        print(f'GPU：{torch.cuda.get_device_name(torch.device(args.device))}', flush=True)
     torch.set_num_threads(args.threads)
     set_random_seed(args.seed)
     {"train": train, "evaluate": evaluate, "play": play}[args.command](args)
