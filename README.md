@@ -1,4 +1,10 @@
 # rl_learning_note
+
+网球训练示例位于 [ppo_tennis](ppo_tennis/README.md)：
+
+- [PPO 训练与辅助奖励](ppo_tennis/README.md)
+- [带经验回放的 Q-learning / DQN](ppo_tennis/DQN.md)，支持 CUDA、评估和视频导出。
+
 install package:
 ```bash
 python -m pip install --upgrade pip
