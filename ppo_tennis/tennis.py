@@ -77,7 +77,8 @@ class RewardLoggingCallback(BaseCallback):
 def reward_config_from_args(args):
     return RewardConfig(return_bonus=args.return_bonus, position_weight=args.position_weight,
                         position_cap=args.position_cap, idle_penalty=args.idle_penalty,
-                        idle_grace=args.idle_grace)
+                        idle_grace=args.idle_grace, position_mode=args.position_mode,
+                        tracking_penalty=args.tracking_penalty, tracking_radius=args.tracking_radius)
 
 
 def model_reward_config(model_path):
@@ -86,8 +87,8 @@ def model_reward_config(model_path):
         path = directory / 'reward_config.json'
         if path.exists():
             data = json.loads(path.read_text(encoding='utf-8'))
-            return RewardConfig(**{k: data[k] for k in asdict(RewardConfig())})
-    return RewardConfig()  # Older models predate auxiliary reward configuration.
+            return RewardConfig.from_saved(data)
+    return RewardConfig.from_saved({})  # Older models predate auxiliary reward configuration.
 
 
 def train(args):
@@ -100,10 +101,10 @@ def train(args):
                                       ["gymnasium", "ale-py", "stable-baselines3", "torch"]})
     reward_config = reward_config_from_args(args)
     write_json(run / 'reward_config.json', dict(enabled=args.reward_shaping,
-               detector='ram-heuristics-v1', **asdict(reward_config)))
+               detector='ram-heuristics-v2', **asdict(reward_config)))
     env = make_env(args.n_envs, args.seed, monitor_dir=run / "monitor",
                    shaping=args.reward_shaping, reward_config=reward_config)
-    eval_env = make_env(seed=10_000 + args.seed)
+    eval_env = make_env(seed=10_000 + args.seed, reward_config=reward_config)
     try:
         model = PPO(
             "CnnPolicy", env, learning_rate=2.5e-4, n_steps=args.n_steps,
@@ -204,7 +205,9 @@ def play(args, algorithm=PPO):
             log_path.parent.mkdir(parents=True, exist_ok=True)
             reward_file = log_path.open('w', newline='', encoding='utf-8')
             columns = ['step', 'action', 'raw', 'shaped', 'auxiliary', 'return_reward',
-                       'position_reward', 'idle_reward', 'return_count', 'own_serve_frames',
+                       'position_reward', 'tracking_reward', 'idle_reward', 'return_count',
+                       'own_serve_frames', 'receiving_frames', 'target_x', 'target_y',
+                       'target_error_pixels',
                        'own_serve', 'rally', 'episode_done']
             reward_writer = csv.DictWriter(reward_file, fieldnames=columns)
             reward_writer.writeheader()
@@ -222,8 +225,11 @@ def play(args, algorithm=PPO):
             action, _ = model.predict(obs, deterministic=not args.stochastic)
             obs, rewards, dones, infos = env.step(action)
             if reward_file is not None:
+                target = infos[0]['tennis_target'] or {}
                 reward_writer.writerow(dict(step=step + 1,
                     action=action_names[int(action[0])], **infos[0]['reward_components'],
+                    target_x=target.get('x'), target_y=target.get('y'),
+                    target_error_pixels=target.get('error_pixels'),
                     own_serve=infos[0]['tennis_state']['own_serve'],
                     rally=infos[0]['tennis_state']['rally'], episode_done=bool(dones[0])))
             score += float(rewards[0])
@@ -275,6 +281,12 @@ def main():
     p.add_argument('--return-bonus', type=nonnegative_float, default=defaults.return_bonus)
     p.add_argument('--position-weight', type=nonnegative_float, default=defaults.position_weight)
     p.add_argument('--position-cap', type=nonnegative_float, default=defaults.position_cap)
+    p.add_argument('--position-mode', choices=['intercept_2d', 'legacy_x'],
+                   default=defaults.position_mode)
+    p.add_argument('--tracking-penalty', type=nonnegative_float, default=defaults.tracking_penalty,
+                   help='接球时远离目标的持续惩罚系数；设为 0 关闭')
+    p.add_argument('--tracking-radius', type=nonnegative_float, default=defaults.tracking_radius,
+                   help='接球位置容差，单位为像素')
     p.add_argument('--idle-penalty', type=nonnegative_float, default=defaults.idle_penalty)
     p.add_argument('--idle-grace', type=positive, default=defaults.idle_grace,
                    help='己方等待发球宽限期，单位为 agent steps')

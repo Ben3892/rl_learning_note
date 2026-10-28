@@ -3,7 +3,7 @@
 from dataclasses import replace
 import unittest
 
-from reward_shaping import RewardConfig, RewardSignals, State
+from reward_shaping import RewardConfig, RewardSignals, State, receiving_target
 
 
 def state(**kwargs):
@@ -47,6 +47,98 @@ class RewardTests(unittest.TestCase):
         self.signals.reset(previous)
         self.assertLess(self.signals.update(replace(previous, player_x=59,
                                                     ball_y=78))['position_reward'], 0)
+
+    def test_vertical_movement_rewarded_in_both_halves(self):
+        for side, player_y, next_y, ball_y, next_ball_y in [
+                (0, 30, 31, 80, 78), (1, 190, 189, 130, 132)]:
+            previous = state(side=side, player_y=player_y, ball_y=ball_y)
+            self.signals.reset(previous)
+            toward = self.signals.update(replace(previous, player_y=next_y,
+                                                 ball_y=next_ball_y))
+            self.assertGreater(toward['position_reward'], 0)
+            self.signals.reset(previous)
+            away = self.signals.update(replace(previous, player_y=2*player_y-next_y,
+                                               ball_y=next_ball_y))
+            self.assertLess(away['position_reward'], 0)
+
+    def test_wall_still_penalized_after_position_budget_exhausted(self):
+        previous = state(player_x=20, ball_x=110, ball_y=100)
+        self.signals.reset(previous)
+        self.signals.position_paid = self.config.position_cap
+        self.signals.position_total = -self.config.position_cap
+        penalties = []
+        for y in range(99, 79, -1):
+            parts = self.signals.update(replace(previous, ball_y=y))
+            self.assertEqual(parts['position_reward'], 0)
+            penalties.append(parts['tracking_reward'])
+        self.assertTrue(all(p < 0 for p in penalties))
+
+    def test_stationary_player_in_receiving_zone_not_penalized(self):
+        previous = state(player_y=55, ball_y=100)
+        self.signals.reset(previous)
+        for y in range(99, 79, -1):
+            parts = self.signals.update(replace(previous, ball_y=y))
+            self.assertEqual(parts['position_reward'], 0)
+            self.assertEqual(parts['tracking_reward'], 0)
+            self.assertEqual(parts['receiving_frames'], 1)
+
+    def test_small_movement_inside_tolerance_cannot_farm_reward(self):
+        previous = state(player_y=55, player_x=80, ball_y=100)
+        self.signals.reset(previous)
+        parts = self.signals.update(replace(previous, player_x=79, ball_y=99))
+        self.assertEqual(parts['position_reward'], 0)
+        self.assertEqual(parts['tracking_reward'], 0)
+
+    def test_tracking_only_during_reachable_incoming_rally(self):
+        cases = [
+            (state(ball_y=80), state(ball_y=82)),  # Outgoing.
+            (state(ball_y=50), state(ball_y=48)),  # Already past receiving line.
+            (state(rally=False), state(rally=False, ball_y=63)),
+            (state(waiting=True, own_serve=False, rally=False),
+             state(waiting=True, own_serve=False, rally=False, ball_y=63)),
+            (state(valid=False), state(valid=False, ball_y=63)),
+        ]
+        for previous, current in cases:
+            self.signals.reset(previous)
+            parts = self.signals.update(current)
+            self.assertEqual(parts['tracking_reward'], 0)
+            self.assertEqual(parts['receiving_frames'], 0)
+            self.assertIsNone(self.signals.target)
+
+    def test_approaching_target_reduces_distance_penalty(self):
+        previous = state(player_x=20, ball_x=100, ball_y=80)
+        self.signals.reset(previous)
+        stationary = self.signals.update(replace(previous, ball_y=78))
+        self.signals.reset(previous)
+        closer = self.signals.update(replace(previous, player_x=21, ball_y=78))
+        self.assertGreater(closer['tracking_reward'], stationary['tracking_reward'])
+
+    def test_tracking_can_be_disabled_without_disabling_progress(self):
+        signals = RewardSignals(replace(self.config, tracking_penalty=0))
+        previous = state(player_x=20, ball_x=100, ball_y=80)
+        signals.reset(previous)
+        parts = signals.update(replace(previous, player_x=21, ball_y=78))
+        self.assertEqual(parts['tracking_reward'], 0)
+        self.assertGreater(parts['position_reward'], 0)
+
+    def test_legacy_config_preserves_horizontal_rewards(self):
+        config = RewardConfig.from_saved(dict(position_weight=0.2, position_cap=0.05))
+        self.assertEqual(config.position_mode, 'legacy_x')
+        signals = RewardSignals(config)
+        previous = state(player_x=60, ball_x=100, ball_y=80)
+        signals.reset(previous)
+        parts = signals.update(replace(previous, player_x=61, ball_y=78))
+        self.assertAlmostEqual(parts['position_reward'], 0.2/160)
+        self.assertEqual(parts['tracking_reward'], 0)
+        saved = dict(position_mode='intercept_2d', tracking_penalty=0.02, tracking_radius=8)
+        self.assertEqual(RewardConfig.from_saved(saved).tracking_penalty, 0.02)
+
+    def test_target_is_fixed_depth_and_within_reachable_court(self):
+        s = state(player_y=25, ball_x=150, ball_y=80)
+        target = receiving_target(s, 5, -2)
+        self.assertEqual(target, receiving_target(replace(s, player_y=40), 5, -2))
+        self.assertLess(target[0], 120)
+        self.assertEqual(target[1], 55)
 
     def test_outgoing_ball_and_arbitrary_movement_not_paid(self):
         self.signals.reset(state(ball_y=80))

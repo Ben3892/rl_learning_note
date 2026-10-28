@@ -115,19 +115,35 @@ JSON 包含随机策略、PPO 的每局原始累计回报、均值、标准差�
 | --- | --- | --- |
 | 原生奖励 | 原样保留 | ALE 返回的得失分反馈 |
 | 成功回击 | 每次 +0.1 | 来球在己方球员附近改变飞行方向，越网后首次在对方场内落地；一次只计一次 |
-| 接球站位 | 系数 0.1 | 来球接近己方时，横向移动缩小预计接球点误差；偏离则小额扣分 |
+| 接球站位 | 系数 0.1 | 来球仍可截获时，左右或前后移动缩小预计接球点误差；偏离则小额扣分 |
+| 接球距离 | 系数 0.01 / agent step | 来球仍可截获时，按目标容差区外的距离持续扣分；停在墙边也不会停止反馈 |
 | 等待发球 | 超时后每个 agent step -0.01 | 确认由己方发球，等待超过 120 个 agent steps（约 8 秒） |
 | 随意移动、按 FIRE | 直接奖励为 0 | 只有有效结果触发其他奖励；移动也不能重置等待计时 |
 
-`训练奖励 = 原生奖励 + 回击奖励 + 站位奖励 + 等待惩罚`。
+`训练奖励 = 原生奖励 + 回击奖励 + 站位奖励 + 接球距离惩罚 + 等待惩罚`。
 评估与默认 play 返回的奖励始终为原生奖励，best_model 按原生评估回报选择。
 
-站位项使用当前球的地面速度线性预测它到达球员当前纵深时的横向坐标。
-针对同一个目标比较移动前后的横向误差：
-`0.1 × (移动前误差 - 移动后误差) / 160`。
-只站着不动不会因为球的移动拿到分；每分的正站位奖励总额最多 0.05，
-站位奖励的净累计值限制在 [-0.05, 0.05]。
-它是启发式反馈，不是严格保证最优策略不变的势函数奖励，也没有完整的落点物理模型。
+新版 `intercept_2d` 使用球的地面速度线性预测接球位置。目标纵深固定为
+上半场 y=55、下半场 y=165（屏幕地面坐标），横向位置限制在场内可站立区域。
+预测不超过 180 个原始帧；球远离己方、已经越过接球线、状态不明或等待发球时不触发。
+固定纵深避免球员通过改变自己的位置来移动奖励目标；这不是完整的落点物理模型，
+不奖励直接追逐空中球的当前坐标。
+
+目标周围默认半径 12 像素为容差区。在同一个目标下比较移动前后的二维欧氏距离，
+令 `excess = max(距离 - 12, 0)`：
+
+```text
+站位改善奖励 = 0.1 × (移动前 excess - 移动后 excess) / 160
+距离惩罚     = -0.01 × min(excess / 160, 1) / 4   # 每个原始帧
+```
+
+4 个原始帧聚合到一个 agent step。保持静止不会因球的移动获得正站位奖励；
+站在容差区内不扣距离分，区内抖动也不刷改善奖励。
+每分的正站位改善奖励总额最多 0.05，站位改善奖励的净累计值限制在 [-0.05, 0.05]。
+距离惩罚是独立项，不受这个预算影响：即使站位预算耗尽或球员卡在边界，
+只要仍需要接球且离目标较远，就继续提供反馈。
+这些是启发式反馈，不严格保证最优策略不变。距离惩罚长期累计可能改变打法，
+需要同时检查原生分数与有效回击次数；不是系数越大越好。
 
 状态从模拟器 RAM 读取，CNN 仍只看图像。坐标参考
 [OCAtari Tennis 状态提取](https://github.com/k4ntz/OC_Atari/blob/master/ocatari/ram/tennis.py)，
@@ -144,19 +160,25 @@ JSON 包含随机策略、PPO 的每局原始累计回报、均值、标准差�
 新建辅助奖励实验，或训练原生奖励对照组：
 
 ```bash
-python tennis.py train --run-dir runs/tennis_shaped_1m --total-timesteps 1000000
+python tennis.py train --run-dir runs/tennis_receiving_v2 --total-timesteps 1000000
 python tennis.py train --run-dir runs/tennis_raw_1m --total-timesteps 1000000 --no-reward-shaping
 ```
 
 可调参数：`--return-bonus`、`--position-weight`、`--position-cap`、
-`--idle-penalty`、`--idle-grace`；奖励项系数设为 0 即可单独关闭该项。
+`--tracking-penalty`、`--tracking-radius`、`--idle-penalty`、`--idle-grace`；
+`--tracking-penalty 0` 可单独关闭持续距离惩罚。
+`--position-mode legacy_x` 可新建旧版横向奖励对照实验（不计算距离惩罚）。
 参数保存在 `config.json` 与 `reward_config.json`，建议同一 seed 下比较每次只改一个奖励项的实验。
+新实验记录 `ram-heuristics-v2` 和 `position_mode=intercept_2d`。
+旧 reward_config 缺少新版字段时，按 `legacy_x` 加载；没有 reward_config 的旧模型也按旧规则诊断，
+不会悄悄套用新版奖励。旧模型权重不会自动改变，应新建目录重新训练。
 
 TensorBoard / progress.csv 中：`rewards/raw`、`rewards/return_reward`、
-`rewards/position_reward`、`rewards/idle_reward`、`rewards/auxiliary`、
+`rewards/position_reward`、`rewards/tracking_reward`、`rewards/idle_reward`、`rewards/auxiliary`、
 `rewards/shaped` 是日志区间内每个 agent step 的平均值。
 `rewards/return_count` 是每步平均有效回击次数，`rewards/own_serve_frames`
 是每个 agent step 中己方等待发球的平均原始帧数。
+`rewards/receiving_frames` 是每步中需要接球且能得到有效预测的平均原始帧数。
 `rewards/episode_shaped` 是已结束回合的候选塑形回报；Monitor CSV 和
 `rollout/ep_rew_mean` 保留原生回报，即使设置 `--no-reward-shaping` 也能观察候选辅助奖励。
 
@@ -172,7 +194,9 @@ python tennis.py play --model runs/tennis_1m/best/best_model.zip --video runs/te
 只记录每次决策前的一帧，回合结束后 VecEnv 自动重置，因此不是逐帧完整录像。
 同时默认生成 `demo.rewards.csv` 和 `demo.rewards.config.json`，记录每步动作、
 原生奖励、各辅助项、候选 shaped 奖励以及发球状态。
-play 自动读取模型同目录或上一级实验目录的 `reward_config.json`；旧模型使用默认系数做诊断。
+play 自动读取模型同目录或上一级实验目录的 `reward_config.json`，兼容旧版配置。
+CSV 新增 `tracking_reward`、`receiving_frames`、`target_x`、`target_y`、
+`target_error_pixels`。目标为最后一个原始帧的预测；该帧没有有效预测时留空。
 这些辅助奖励仅用于展示诊断，不影响 play 的动作选择或原生奖励。
 用 `--reward-log 路径.csv` 可指定日志位置，窗口模式也支持。
 
@@ -211,10 +235,15 @@ ALE 0.11.2、SB3 2.9.0、PyTorch 2.14.1。依赖装在临时虚拟环境
 python -m unittest -v test_reward_shaping
 ```
 
-- 11 个事件测试覆盖等待宽限期、对方发球不罚、无效移动不加分、站位预算、
+- 20 个事件测试覆盖等待宽限期、对方发球不罚、无效移动不加分、站位预算、
   两侧回击落地、发球不算回击、场外落地不加分、得失分与终止时清理事件。
 - 5000 个随机 agent steps 检测到 10 次有效回击事件，原始帧轨迹保存在
   `runs/shaping_smoke/return_event_traces.json`；这不是策略学习成果。
 - 对照同 seed、同动作的原生/塑形环境，2000 步的画面、原生回报和回合边界完全相同。
 - 从同一个模拟器状态分支验证：己方发球在 NOOP 下等待、FIRE 后开始，对方发球在 NOOP 下自行开始。
 - 已完成 512 步塑形 PPO 训练、分项日志和模型保存；未进行长训练验证效果。
+
+新版接球奖励（2026-10-28）额外覆盖二维移动、墙边持续反馈、目标区静止、
+容差区不刷分、出球/错过接球线不罚、惩罚单独关闭与旧配置兼容。
+本地完成 512 步 PPO 短训练；日志见 `runs/receiving_v2_smoke/`。
+该验证只说明奖励触发和训练流程正常，尚未证明百万步后的策略效果。

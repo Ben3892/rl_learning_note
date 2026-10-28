@@ -70,6 +70,8 @@ tensorboard --logdir runs/dqn_tennis_cuda
 
 继续支持所有辅助奖励参数，包括 `--no-reward-shaping`、`--return-bonus`、
 `--position-weight`、`--position-cap`、`--idle-penalty`、`--idle-grace`。
+同时支持新版二维接球站位与持续距离反馈：`--position-mode`、
+`--tracking-penalty`、`--tracking-radius`，与 PPO 使用同一奖励实现，详见 README。
 辅助奖励改变后应新建实验，不混用旧奖励下的回放数据。
 
 关注 `train/loss`、`train/n_updates`、`train/exploration_rate`、

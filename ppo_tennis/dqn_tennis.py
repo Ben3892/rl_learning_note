@@ -109,7 +109,7 @@ def train(args):
                ['gymnasium', 'ale-py', 'stable-baselines3', 'torch']})
     config = reward_config_from_args(args)
     write_json(run / 'reward_config.json', dict(enabled=args.reward_shaping,
-               detector='ram-heuristics-v1', **asdict(config)))
+               detector='ram-heuristics-v2', **asdict(config)))
     env = make_env(seed=args.seed, shaping=args.reward_shaping,
                    reward_config=config, monitor_dir=run / 'monitor')
     eval_env = make_env(seed=10_000 + args.seed, max_agent_steps=args.eval_max_steps,
@@ -188,6 +188,9 @@ def main():
                           ('position-cap', c.position_cap), ('idle-penalty', c.idle_penalty)]:
         p.add_argument('--' + flag, type=nonnegative_float, default=default)
     p.add_argument('--idle-grace', type=positive, default=c.idle_grace)
+    p.add_argument('--position-mode', choices=['intercept_2d', 'legacy_x'], default=c.position_mode)
+    p.add_argument('--tracking-penalty', type=nonnegative_float, default=c.tracking_penalty)
+    p.add_argument('--tracking-radius', type=nonnegative_float, default=c.tracking_radius)
     p = sub.add_parser('evaluate')
     p.add_argument('--model', type=Path, required=True)
     p.add_argument('--episodes', type=positive, default=5)

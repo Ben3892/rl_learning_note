@@ -20,6 +20,20 @@ class RewardConfig:
     idle_penalty: float = 0.01  # Per agent step (4 emulator frames), only own serve.
     idle_grace: int = 120  # Agent steps; 8 seconds at 15 decisions/s.
     frame_skip: int = 4
+    position_mode: str = 'intercept_2d'
+    tracking_penalty: float = 0.01  # Per agent step, scaled by normalized error.
+    tracking_radius: float = 12.0  # Pixel tolerance around the receiving position.
+
+    @classmethod
+    def from_saved(cls, data):
+        # Old experiments used horizontal progress only. Preserve that reward
+        # definition when replaying old models instead of silently changing it.
+        values = asdict(cls(position_mode='legacy_x', tracking_penalty=0.0))
+        values.update({key: data[key] for key in values if key in data})
+        config = cls(**values)
+        if config.position_mode not in ('legacy_x', 'intercept_2d'):
+            raise ValueError(f'未知站位奖励模式：{config.position_mode}')
+        return config
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,25 @@ def in_court(x, y):
     return 50 <= y <= 180 and left + 2 <= x <= 160 - left - 2
 
 
+def receiving_target(state, dx, dy):
+    """Predict an intercept at a fixed receiving depth, not the ball's current xy.
+
+    Conservative linear ground-plane extrapolation; no feedback after the ball
+    has passed this line or when the intercept is implausibly far in the future.
+    A fixed target depth prevents moving the player from moving the target.
+    """
+    toward = -1 if state.side == 0 else 1
+    if dy * toward <= 0:
+        return None
+    target_y = 55.0 if state.side == 0 else 165.0
+    eta = (target_y - state.ball_y) / dy
+    if not 0 <= eta <= 180:
+        return None
+    left = 40 - (target_y - 49) * 0.12
+    target_x = float(np.clip(state.ball_x + dx * eta, left + 5, 155 - left))
+    return target_x, target_y
+
+
 class RewardSignals:
     """Pure state machine, separated from Gym for replayable event tests."""
 
@@ -71,12 +104,15 @@ class RewardSignals:
         self.wait_frames = 0
         self.position_paid = 0.0
         self.position_total = 0.0
+        self.target = None
         self.totals = dict(return_reward=0.0, position_reward=0.0, idle_reward=0.0,
+                           tracking_reward=0.0, receiving_frames=0.0,
                            return_count=0.0, own_serve_frames=0.0)
 
     def update(self, state, raw_reward=0.0, terminated=False, truncated=False):
         c, prev = self.config, self.previous
         parts = dict.fromkeys(self.totals, 0.0)
+        self.target = None
         # A score, side switch or terminal step must never look like a hit.
         boundary = (raw_reward != 0 or terminated or truncated or prev is None
                     or state.side != prev.side)
@@ -134,14 +170,33 @@ class RewardSignals:
                         elif candidate['age'] > 180 or incoming:
                             self.pending_return = None
 
-                    # Use the SAME predicted intercept for both player positions:
-                    # a stationary player cannot earn reward just because the ball moves.
+                    # The SAME target is used for old/new positions: moving ball
+                    # alone cannot generate positive progress for a stationary player.
                     if incoming and abs(dy) > 0:
-                        eta = (state.player_y - state.ball_y) / dy
-                        if 0 <= eta <= 180:
-                            target_x = float(np.clip(state.ball_x + dx * eta, 25, 135))
-                            gain = (abs(prev.player_x - target_x)
-                                    - abs(state.player_x - target_x)) / 160
+                        target = receiving_target(state, dx, dy)
+                        gain = None
+                        if c.position_mode == 'legacy_x':
+                            eta = (state.player_y - state.ball_y) / dy
+                            if 0 <= eta <= 180:
+                                target_x = float(np.clip(state.ball_x + dx * eta, 25, 135))
+                                gain = (abs(prev.player_x - target_x)
+                                        - abs(state.player_x - target_x)) / 160
+                        elif target is not None:
+                            target_x, target_y = target
+                            old_error = float(np.hypot(prev.player_x - target_x,
+                                                       prev.player_y - target_y))
+                            error = float(np.hypot(state.player_x - target_x,
+                                                   state.player_y - target_y))
+                            old_excess = max(old_error - c.tracking_radius, 0.0)
+                            excess = max(error - c.tracking_radius, 0.0)
+                            gain = (old_excess - excess) / 160
+                            parts['receiving_frames'] = 1.0
+                            # Unlike progress, distance feedback persists at a wall
+                            # and after the position-reward budget is exhausted.
+                            parts['tracking_reward'] = (-c.tracking_penalty / c.frame_skip
+                                                        * min(excess / 160, 1.0))
+                            self.target = dict(x=target_x, y=target_y, error_pixels=error)
+                        if gain is not None:
                             position = c.position_weight * gain
                             if position > 0:
                                 position = min(position, max(c.position_cap - self.position_paid, 0))
@@ -203,11 +258,13 @@ class TennisRewardWrapper(gym.Wrapper):
         obs, raw, terminated, truncated, info = self.env.step(action)
         totals = self.tracker.signals.totals
         components = {k: totals[k] - before[k] for k in totals}
-        aux = sum(components[k] for k in ('return_reward', 'position_reward', 'idle_reward'))
+        aux = sum(components[k] for k in
+                  ('return_reward', 'position_reward', 'idle_reward', 'tracking_reward'))
         shaped = float(raw + aux)
         info['reward_components'] = dict(raw=float(raw), shaped=shaped, auxiliary=aux,
                                          **components)
         info['tennis_state'] = asdict(self.tracker.state)
+        info['tennis_target'] = self.tracker.signals.target
         self.episode_shaped += shaped
         if terminated or truncated:
             info['episode_shaped_reward'] = self.episode_shaped
