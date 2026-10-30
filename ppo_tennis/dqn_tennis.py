@@ -12,53 +12,15 @@ import time
 import numpy as np
 import torch
 from stable_baselines3 import DQN
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.utils import set_random_seed
 
 from device_utils import device_info, resolve_device
+from evaluation import VisibleEvalCallback
 from reward_shaping import RewardConfig
 from tennis import (ROOT, RewardLoggingCallback, evaluate, make_env, nonnegative_float,
                     play, positive, reward_config_from_args, write_json)
-
-
-class VisibleEvalCallback(EvalCallback):
-    """Single-environment, bounded evaluation with heartbeat and diagnostics."""
-
-    def _on_step(self):
-        triggered = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
-        if triggered:
-            self.eval_steps = 0
-            self.wait_steps = 0
-            self.return_count = 0
-            self.episodes = []
-            start = time.monotonic()
-            print(f'\n[eval] 开始：训练步数={self.num_timesteps}，'
-                  f'评估 {self.n_eval_episodes} 局；训练暂时等待', flush=True)
-        result = super()._on_step()
-        if triggered:
-            summary = dict(timesteps=self.num_timesteps, steps=self.eval_steps,
-                           elapsed_seconds=time.monotonic() - start,
-                           own_serve_steps=self.wait_steps, returns=self.return_count,
-                           episodes=self.episodes)
-            write_json(Path(self.best_model_save_path).parent / 'eval' /
-                       f'diagnostics_{self.num_timesteps}.json', summary)
-            print(f'[eval] 结束：耗时 {summary["elapsed_seconds"]:.1f}s，继续训练\n', flush=True)
-        return result
-
-    def _log_success_callback(self, locals_, globals_):
-        super()._log_success_callback(locals_, globals_)
-        info = locals_['info']
-        self.eval_steps += 1
-        self.wait_steps += int(info['tennis_state']['own_serve'])
-        self.return_count += int(info['reward_components']['return_count'])
-        if self.eval_steps % 1000 == 0:
-            print(f'[eval] 已执行 {self.eval_steps} 步，已结束 {len(self.episodes)} 局', flush=True)
-        if locals_['done'] and 'episode' in info:
-            entry = dict(reward=info['episode']['r'], steps=info['episode']['l'],
-                         truncated=bool(info.get('TimeLimit.truncated')))
-            self.episodes.append(entry)
-            print(f'[eval] 第 {len(self.episodes)} 局：{entry}', flush=True)
 
 
 class ReplayLoggingCallback(BaseCallback):
@@ -113,7 +75,7 @@ def train(args):
     env = make_env(seed=args.seed, shaping=args.reward_shaping,
                    reward_config=config, monitor_dir=run / 'monitor')
     eval_env = make_env(seed=10_000 + args.seed, max_agent_steps=args.eval_max_steps,
-                        reward_config=config)
+                        reward_config=config, eval_idle_limit=args.eval_idle_limit)
     try:
         replay_bytes = 2 * args.buffer_size * int(np.prod(env.observation_space.shape))
         print(f'回放池观测数组约 {replay_bytes / 1024**3:.2f} GiB 主机内存；'
@@ -207,6 +169,8 @@ def main():
         if command != 'play':
             p.add_argument('--eval-max-steps', type=positive, default=5000,
                            help='每局评估 agent step 上限，超时单独标记')
+            p.add_argument('--eval-idle-limit', type=positive, default=150,
+                           help='己方连续等待发球的评估截断上限，单位为 agent steps')
         p.add_argument('--seed', type=int, default=20_000 if command == 'evaluate' else 0)
         p.add_argument('--device', default='cpu', help='cpu / cuda / cuda:N / auto')
         p.add_argument('--threads', type=positive, default=4)

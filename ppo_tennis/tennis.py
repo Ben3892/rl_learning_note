@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.atari_wrappers import AtariWrapper
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
@@ -22,6 +22,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecTran
 
 from reward_shaping import RewardConfig, TennisRAMTracker, TennisRewardWrapper
 from device_utils import device_info, resolve_device
+from evaluation import EvaluationLimits, VisibleEvalCallback
 
 gym.register_envs(ale_py)
 ROOT = Path(__file__).resolve().parent
@@ -36,7 +37,7 @@ def write_json(path, data):
 
 
 def make_env(n_envs=1, seed=0, render_mode=None, monitor_dir=None,
-             shaping=False, reward_config=None, max_agent_steps=None):
+             shaping=False, reward_config=None, max_agent_steps=None, eval_idle_limit=None):
     """Same image pipeline; training optionally adds auxiliary rewards."""
     def factory(rank):
         def create():
@@ -47,8 +48,8 @@ def make_env(n_envs=1, seed=0, render_mode=None, monitor_dir=None,
             tracker = TennisRAMTracker(env, reward_config or RewardConfig())
             env = AtariWrapper(tracker, frame_skip=4, terminal_on_life_loss=False,
                                clip_reward=False)
-            if max_agent_steps is not None:
-                env = gym.wrappers.TimeLimit(env, max_episode_steps=max_agent_steps)
+            if max_agent_steps is not None or eval_idle_limit is not None:
+                env = EvaluationLimits(env, tracker, max_agent_steps, eval_idle_limit)
             filename = None
             if monitor_dir is not None:
                 Path(monitor_dir).mkdir(parents=True, exist_ok=True)
@@ -104,7 +105,8 @@ def train(args):
                detector='ram-heuristics-v2', **asdict(reward_config)))
     env = make_env(args.n_envs, args.seed, monitor_dir=run / "monitor",
                    shaping=args.reward_shaping, reward_config=reward_config)
-    eval_env = make_env(seed=10_000 + args.seed, reward_config=reward_config)
+    eval_env = make_env(seed=10_000 + args.seed, reward_config=reward_config,
+                        max_agent_steps=args.eval_max_steps, eval_idle_limit=args.eval_idle_limit)
     try:
         model = PPO(
             "CnnPolicy", env, learning_rate=2.5e-4, n_steps=args.n_steps,
@@ -118,7 +120,7 @@ def train(args):
             RewardLoggingCallback(),
             CheckpointCallback(save_freq=max(args.save_freq // args.n_envs, 1),
                                save_path=str(run / "checkpoints"), name_prefix="ppo_tennis"),
-            EvalCallback(eval_env, best_model_save_path=str(run / "best"),
+            VisibleEvalCallback(eval_env, best_model_save_path=str(run / "best"),
                          log_path=str(run / "eval"),
                          eval_freq=max(args.eval_freq // args.n_envs, 1),
                          n_eval_episodes=args.eval_episodes, deterministic=True),
@@ -142,9 +144,11 @@ def evaluate(args, algorithm=PPO, label='ppo'):
               "note": "原始累计奖励，不等于胜率；truncated 表示时间上限。"}
     max_steps = getattr(args, 'eval_max_steps', None)
     result['max_agent_steps'] = max_steps
+    idle_limit = getattr(args, 'eval_idle_limit', None)
+    result['eval_idle_limit'] = idle_limit
     for policy_name in ("random", label):
         env = make_env(max_agent_steps=max_steps,
-                       reward_config=model_reward_config(args.model))
+                       reward_config=model_reward_config(args.model), eval_idle_limit=idle_limit)
         episodes = []
         try:
             for index in range(args.episodes):
@@ -169,11 +173,14 @@ def evaluate(args, algorithm=PPO, label='ppo'):
                     if dones[0]:
                         episodes.append({"seed": seed, "reward": score, "steps": length,
                                          'own_serve_steps': waiting, 'returns': returns,
+                                         'stop_reason': infos[0].get('evaluation_stop_reason', 'game_over'),
                                          "truncated": bool(infos[0].get("TimeLimit.truncated"))})
                         print(f"{policy_name}: seed={seed}, reward={score}, steps={length}", flush=True)
                         break
             scores = [episode["reward"] for episode in episodes]
             result[policy_name] = {"mean_reward": float(np.mean(scores)),
+                             'completed_episodes': sum(not e['truncated'] for e in episodes),
+                             'truncated_episodes': sum(e['truncated'] for e in episodes),
                              "std_reward": float(np.std(scores)), "episodes": episodes}
         finally:
             env.close()
@@ -303,6 +310,10 @@ def main():
     p.add_argument('--reward-log', type=Path,
                    help='动作和奖励分项 CSV；视频模式默认保存到视频同名 .rewards.csv')
     for p in sub.choices.values():
+        if not p.prog.endswith('play'):
+            p.add_argument('--eval-max-steps', type=positive, default=5000)
+            p.add_argument('--eval-idle-limit', type=positive, default=150,
+                           help='评估时己方连续等待发球的 agent step 上限；150 约为10秒')
         p.add_argument("--seed", type=int, default=20_000 if p.prog.endswith("evaluate") else 0)
         p.add_argument("--device", default="cpu",
                        help="cpu / cuda / cuda:N / auto；显式指定 CUDA 时不可回退 CPU")
