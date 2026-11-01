@@ -1,5 +1,8 @@
 # PPO Tennis MVP
 
+新增：[RAM 状态 + MLP 的 PPO 对照实验](RAM_PPO.md)，包含自动发球、势函数塑形和固定动作基线。
+
+
 新增：[带经验回放的 Q-learning / DQN 版本](DQN.md)，入口为 `dqn_tennis.py`，
 支持训练、原生奖励评估、视频导出和 CUDA，与 PPO 使用独立的模型与实验目录。
 
@@ -78,6 +81,34 @@ python tennis.py play --model runs/smoke/final_model.zip --video runs/smoke/demo
 这会执行 PPO 更新并生成约 10 秒的 MP4。模型还没学会打球是正常现象。
 PPO 按完整 rollout 收集样本，实际 transitions 可能向上取整到 `n_envs * n_steps` 的倍数。
 `--run-dir` 必须不存在，防止覆盖实验；可换用 smoke2 等名称重新运行。
+
+## 发球停滞对照实验
+
+在 WSL 中运行（脚本会初始化 Conda 并再次显式激活 `yja`）：
+
+```bash
+cd /home/ben/rl_learning_note/ppo_tennis
+conda activate yja
+bash train_ppo_idle.sh
+```
+
+脚本默认新建带时间戳的实验目录，训练 100 万 transitions，使用 `cuda:0`。
+相对 `tennis_cuda_v5`，仅将等待发球宽限期从 120 改为 15 个决策步、
+等待惩罚从每步 0.01 改为 0.05，并将每次评估从 1 局增加为 5 局。
+这是检验发球停滞原因的实验设置，不保证提高得分；其余奖励及 PPO 设置保持一致。
+
+可指定新的目录或步数（已有实验目录会拒绝覆盖）：
+
+```bash
+RUN_DIR=runs/tennis_idle_trial TOTAL_TIMESTEPS=1000000 bash train_ppo_idle.sh
+tensorboard --logdir runs
+```
+
+完整控制台输出保存在 `<run-dir>.console.log`，退出码保存在 `<run-dir>.exitcode`。
+重点对照原始 `rollout/ep_rew_mean`、`eval/mean_reward`、
+`eval/stall_rate`、`eval/truncated_rate`，以及评估诊断 JSON 的回球次数和结束原因。
+`rewards/shaped` 是每步训练奖励，惩罚增大后不能用它的绝对值直接判断是否胜过旧模型。
+仅完成的比赛得分应与提前截断得分分开解读；5 局评估也不能与旧版单局视为等精度比较。
 
 ## 训练并评估
 
@@ -181,6 +212,29 @@ TensorBoard / progress.csv 中：`rewards/raw`、`rewards/return_reward`、
 `rewards/receiving_frames` 是每步中需要接球且能得到有效预测的平均原始帧数。
 `rewards/episode_shaped` 是已结束回合的候选塑形回报；Monitor CSV 和
 `rollout/ep_rew_mean` 保留原生回报，即使设置 `--no-reward-shaping` 也能观察候选辅助奖励。
+
+## PPO 最佳模型导出 MP4
+
+新增脚本会先初始化 Conda 并执行 `conda activate yja`，默认读取
+`runs/tennis_cuda_v6_idle_yja/best/best_model.zip`（本次训练的 90 万步最佳模型）：
+
+```bash
+cd /home/ben/rl_learning_note/ppo_tennis
+bash export_ppo_mp4.sh
+```
+
+默认使用 CUDA 和确定性策略，导出 2000 帧、15 fps，约 133 秒。
+视频保存在实验目录的 `videos/ppo_best_<时间戳>.mp4`，同时生成同名动作/奖励 CSV
+及配置 JSON。录像为定长片段，可能跨比赛；指定 seed 的演示不保证复现某次评估轨迹。
+
+可指定输出路径、时长、模型或设备；相对路径均以脚本所在目录为起点：
+
+```bash
+VIDEO=runs/tennis_cuda_v6_idle_yja/videos/best_900k.mp4 STEPS=3000 bash export_ppo_mp4.sh
+MODEL=runs/tennis_cuda_v6_idle_yja/final_model.zip DEVICE=cpu bash export_ppo_mp4.sh
+```
+
+`STEPS=3000` 对应约 200 秒；已有视频路径会拒绝覆盖，换一个 `VIDEO` 即可。
 
 ## 展示成果
 
