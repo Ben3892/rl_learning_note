@@ -3,7 +3,38 @@
 入口为 `ram_ppo.py`，环境在 `ram_env.py`。这是与原图像版分开的实验，
 目标是先验证策略能否根据位置、球速和换边状态进行控制。
 
+## 当前默认：回中 / 追球引导
+
+按用户指定的规则，默认训练模式为 `recover_chase`，`beta=0.05`：
+
+- 球飞向对方（outgoing）：目标为己方可活动区域中心。上半场为 (80, 72.5)，下半场为 (80, 153.5)。
+- 球飞向己方（incoming）：目标跟随球的地面/影子位置；x 限制在 [20, 148]，
+  y 限制在己方可活动区（上半场 [47, 98]、下半场 [120, 187]），避免目标跨到对方半场。
+- 方向按己方所在半场计算：上半场 dy<0 为来球，下半场 dy>0 为来球。
+- 发球、得分/换边造成速度失效、方向不明或没有有效回合时不设移动目标。
+- 坐标范围来自当前 ROM 的玩家脚部坐标，是可调整的经验值。
+- 继续使用距离势函数差值作为辅助奖励；PPO 自己选择移动动作，不强制执行追球/回中脚本。
+  该改动不保证收敛；效果仍需用完整比赛原始得分与固定动作基线检验。
+
+```bash
+cd /home/ben/rl_learning_note/ppo_tennis
+bash train_ppo_ram.sh
+```
+
+脚本自动激活 yja，保留当前 DEVICE 默认值。可显式设置设备与奖励强度：
+
+```bash
+DEVICE=cpu BETA=0.05 bash train_ppo_ram.sh
+TARGET_MODE=recover_chase BETA=0 bash train_ppo_ram.sh  # 相同新目标观测，但仅训练原始得分
+TARGET_MODE=intercept BETA=0 bash train_ppo_ram.sh      # 复现旧版目标与原始奖励配置
+```
+
+目标模式写入 config.json 和 observation_schema.json，评估与录像读取同一配置。
+旧配置缺少 target_mode 时继续使用 intercept，避免改变旧模型输入的目标特征。
+旧模型需要重新训练才能学习新规则。视频动作 CSV 新增 ball_direction、target_x、target_y。
+
 ## 环境与奖励
+
 
 - 输入为 128 个归一化 RAM 字节、19 个几何/速度/阶段特征，以及上一次实际动作的 18 维 one-hot，共 165 维。
 - 坐标和特征裁剪到 [-1, 1]；得分、换边、阶段变化和不合理瞬移会清除球速。
@@ -15,7 +46,7 @@
 - 保留 ALE 的 0.25 sticky actions，每次决策跳过 4 个原始帧。
 - 不使用原有的站位、距离、等待惩罚或回球附加奖励。回球事件仅用于诊断。
 - 塑形公式：`raw + beta * (gamma * Phi(next) - Phi(previous))`。
-  可拦截来球阶段 `Phi = -min(拦截距离 / 160, 1)`，其他阶段为 0。
+  有效目标阶段 `Phi = -min(目标距离 / 160, 1)`，没有目标时为 0；目标定义由 target_mode 决定。
   每个 agent step 计算一次，与 PPO 使用相同 gamma；真终止的下一势值为 0，
   时间截断保留下一势值，由 SB3 用 terminal_observation bootstrap。
 - Monitor 始终位于塑形之前，`rollout/ep_rew_mean` 和评估都保留原始得分。
@@ -32,9 +63,9 @@ bash train_ppo_ram.sh
 默认 25 万 transitions、8 环境 × 256 steps、batch 256、4 epochs、
 MLP 的 actor/critic 各 2 层 128 单元，gamma 0.99、GAE lambda 0.95、
 clip 0.1、entropy 0.01、target KL 0.02。
-学习率从 1e-4 线性减至 1e-5。默认 CPU、PyTorch 单线程：
-小型 MLP 无需依赖 CNN/GPU 路径，可用 `DEVICE=cuda:0` 做独立吞吐量对照。
-这些是实验起点，不能保证收敛。根据本次对照，脚本默认 beta=0；用 BETA=0.05 开启势函数奖励。
+学习率从 1e-4 线性减至 1e-5。PyTorch 单线程；脚本当前默认 CUDA（保留用户设置）。
+小型 MLP 也可用 `DEVICE=cpu`，请根据本机实测吞吐量选择。
+这些是实验起点，不能保证收敛。当前新规则默认 beta=0.05；用 BETA=0 关闭辅助奖励。旧版目标的历史对照见实验结果报告。
 
 比较有/无势函数奖励，分别使用新目录：
 
@@ -73,7 +104,7 @@ bash train_ppo_ram.sh --no-auto-serve
 - `progress.csv`、TensorBoard、原始 Monitor、checkpoint、final_model 和控制台日志照常保存。
 
 动作占比高只作诊断，不作为奖励惩罚，也不会直接禁止合法的连续动作。
-持续挥拍也可能碰到球，回球次数不能代替完整比赛得分和基线比较。
+角色位于合适位置时会自动回球，回球次数不能代替完整比赛得分和基线比较。
 每轮只用单个训练 seed，不能据此断言统计显著性；正式结论还需要多次训练 seeds。
 
 独立重评（模型路径替换为实际实验目录）：

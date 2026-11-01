@@ -54,8 +54,8 @@
 ```bash
 conda activate yja
 cd /home/ben/rl_learning_note/ppo_tennis
-RUN_DIR=runs/ram_raw_repeat BETA=0 bash train_ppo_ram.sh
-RUN_DIR=runs/ram_potential_repeat BETA=0.05 bash train_ppo_ram.sh
+RUN_DIR=runs/ram_raw_repeat TARGET_MODE=intercept BETA=0 bash train_ppo_ram.sh
+RUN_DIR=runs/ram_potential_repeat TARGET_MODE=intercept BETA=0.05 bash train_ppo_ram.sh
 ```
 
 ## 合并等价移动后的诊断

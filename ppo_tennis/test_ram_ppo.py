@@ -14,7 +14,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from ram_env import (OBS_SIZE, RAMControlEnv, PotentialReward, ball_velocity, encode_observation,
-                     make_ram_env, potential_transition, target_and_potential)
+                     make_ram_env, potential_transition, target_and_potential, flight_phase)
 from ram_ppo import completed_score, run_suite, summary
 from reward_shaping import State
 
@@ -40,6 +40,55 @@ class OneTransition(gym.Env):
 
 
 class RAMTests(unittest.TestCase):
+    def test_direction_reverses_after_switching_halves(self):
+        for side, incoming, outgoing in [(0, -4, 4), (1, 4, -4)]:
+            s = state(side=side)
+            self.assertEqual(flight_phase(s, incoming), 'incoming')
+            self.assertEqual(flight_phase(s, outgoing), 'outgoing')
+
+    def test_outgoing_ball_targets_center_of_own_half(self):
+        top, _ = target_and_potential(state(ball_y=140), 3, 4, 'recover_chase')
+        bottom, _ = target_and_potential(state(side=1, ball_y=70), 3, -4, 'recover_chase')
+        self.assertEqual(top, (80.0, 72.5))
+        self.assertEqual(bottom, (80.0, 153.5))
+        # The player's current position must not move the recovery destination.
+        other, _ = target_and_potential(state(player_x=120, player_y=95), 0, 4, 'recover_chase')
+        self.assertEqual(top, other)
+
+    def test_incoming_ball_targets_its_ground_position(self):
+        top, _ = target_and_potential(state(ball_x=100, ball_y=70), 0, -4, 'recover_chase')
+        bottom, _ = target_and_potential(
+            state(side=1, ball_x=95, ball_y=160), 0, 4, 'recover_chase')
+        self.assertEqual(top, (100.0, 70.0))
+        self.assertEqual(bottom, (95.0, 160.0))
+
+    def test_chase_target_never_crosses_net_or_movement_bounds(self):
+        top, _ = target_and_potential(state(ball_x=155, ball_y=160), 0, -4, 'recover_chase')
+        bottom, _ = target_and_potential(
+            state(side=1, ball_x=5, ball_y=50), 0, 4, 'recover_chase')
+        self.assertEqual(top, (148.0, 98.0))
+        self.assertEqual(bottom, (20.0, 120.0))
+
+    def test_unknown_direction_or_non_rally_has_no_guidance(self):
+        for s, dy in [(state(), 0), (state(valid=False), -4),
+                      (state(waiting=True), -4), (state(rally=False), -4),
+                      (state(side=2), -4)]:
+            self.assertEqual(target_and_potential(s, 0, dy, 'recover_chase'), (None, 0.0))
+
+    def test_closer_to_recovery_or_chase_target_has_higher_potential(self):
+        cases = [(state(player_x=30, player_y=47), state(player_x=50, player_y=60), 4),
+                 (state(ball_x=110, ball_y=75), state(player_x=80, player_y=65,
+                                                          ball_x=110, ball_y=75), -4),
+                 (state(side=1, player_x=30, player_y=187),
+                  state(side=1, player_x=50, player_y=170), -4)]
+        for old, new, dy in cases:
+            _, old_phi = target_and_potential(old, 0, dy, 'recover_chase')
+            _, new_phi = target_and_potential(new, 0, dy, 'recover_chase')
+            self.assertGreater(new_phi, old_phi)
+        # The legacy mode remains unchanged for existing checkpoints/configs.
+        target, _ = target_and_potential(state(), 0, -4, 'intercept')
+        self.assertEqual(target[1], 55.0)
+
     def test_velocity_cleared_on_point_side_phase_and_teleport(self):
         first = state()
         self.assertEqual(ball_velocity(first, replace(first, ball_y=88)), (0, -2))
@@ -133,12 +182,12 @@ class RAMTests(unittest.TestCase):
 
     def test_real_environment_api_and_model_roundtrip(self):
         torch.set_num_threads(1)
-        raw = make_ram_env(auto_serve=True, shaping=True)
+        raw = make_ram_env(auto_serve=True, shaping=True, target_mode='recover_chase')
         try:
             check_env(raw, skip_render_check=True)
         finally:
             raw.close()
-        env = DummyVecEnv([lambda: make_ram_env(auto_serve=True, shaping=True)])
+        env = DummyVecEnv([lambda: make_ram_env(auto_serve=True, shaping=True, target_mode='recover_chase')])
         try:
             model = PPO('MlpPolicy', env, n_steps=16, batch_size=16, n_epochs=1, device='cpu')
             model.learn(32)

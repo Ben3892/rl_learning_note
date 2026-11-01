@@ -16,7 +16,7 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from device_utils import device_info, resolve_device
-from ram_env import FEATURE_NAMES, OBS_SIZE, make_ram_env
+from ram_env import FEATURE_NAMES, OBS_SIZE, TARGET_MODES, make_ram_env
 
 ROOT = Path(__file__).resolve().parent
 BASELINES = ('random', 'downfire', 'upfire', 'fire')
@@ -78,6 +78,7 @@ def run_suite(model, settings, policies, seeds, max_steps=5000, idle_limit=150):
             env = make_ram_env(auto_serve=settings['auto_serve'], shaping=False,
                                gamma=settings['gamma'], beta=settings['beta'],
                                serve_mode=settings.get('serve_mode', 'fire'),
+                               target_mode=settings.get('target_mode', 'intercept'),
                                max_steps=max_steps, idle_limit=idle_limit)
             names = env.unwrapped.get_action_meanings()
             episodes = []
@@ -95,7 +96,7 @@ def run_suite(model, settings, policies, seeds, max_steps=5000, idle_limit=150):
                         elif policy in ('downfire', 'upfire', 'fire'):
                             action = names.index(policy.upper())
                         else:
-                            action, _ = model.predict(obs, deterministic=policy == 'ppo')
+                            action, _ = model.predict(obs, deterministic=policy in ('ppo', 'dqn'))
                             action = int(action)
                         obs, reward, terminated, truncated, info = env.step(action)
                         raw += float(reward)
@@ -139,7 +140,9 @@ def completed_score(result):
 def write_observation(run, baselines, latest_step=None):
     files = sorted((run / 'eval').glob('diagnostics_*.json'),
                    key=lambda file: int(file.stem.split('_')[-1]))
-    lines = ['# RAM + MLP PPO experiment', '',
+    settings = json.loads((run / 'config.json').read_text())
+    lines = [f"# RAM + MLP {settings.get('algorithm', 'PPO')} experiment", '',
+             f"Target mode: {settings.get('target_mode', 'intercept')}; beta: {settings['beta']}.",
              'Assisted task: auto-serve setting is shared by training, evaluation and video.',
              'Inputs: normalized RAM, geometry/velocity/phase features and last executed action.',
              'Training reward: raw + beta * (gamma * Phi(next) - Phi(previous)).',
@@ -224,7 +227,7 @@ def train(args):
                ('gymnasium', 'ale-py', 'stable-baselines3', 'torch')})
     write_json(run / 'observation_schema.json',
                dict(size=OBS_SIZE, ram_bytes=128, features=FEATURE_NAMES,
-                    executed_action_one_hot=18, frame_skip=4))
+                    executed_action_one_hot=18, frame_skip=4, target_mode=args.target_mode))
     print('[eval] fixed-seed baselines, same assisted environment', flush=True)
     baselines = run_suite(None, settings, BASELINES, range(10000, 10000 + args.eval_episodes),
                           args.eval_max_steps, args.eval_idle_limit)
@@ -233,7 +236,7 @@ def train(args):
     env = DummyVecEnv([
         lambda rank=rank: make_ram_env(
             auto_serve=args.auto_serve, shaping=True, gamma=args.gamma, beta=args.beta,
-            serve_mode=args.serve_mode,
+            serve_mode=args.serve_mode, target_mode=args.target_mode,
             monitor_file=str(run / 'monitor' / str(rank)))
         for rank in range(args.n_envs)
     ])
@@ -295,7 +298,8 @@ def play(args):
     model = PPO.load(args.model, device=args.device)
     env = make_ram_env(auto_serve=settings['auto_serve'], shaping=False,
                        gamma=settings['gamma'], beta=settings['beta'], render_mode='rgb_array',
-                       serve_mode=settings.get('serve_mode', 'fire'))
+                       serve_mode=settings.get('serve_mode', 'fire'),
+                       target_mode=settings.get('target_mode', 'intercept'))
     args.video.parent.mkdir(parents=True, exist_ok=True)
     log = args.video.with_suffix('.actions.csv')
     try:
@@ -304,19 +308,24 @@ def play(args):
         with imageio.get_writer(args.video, fps=15, codec='libx264', macro_block_size=2) as video, log.open('w') as stream:
             writer = csv.DictWriter(stream, fieldnames=[
                 'step', 'requested', 'executed', 'auto_serve', 'side', 'raw', 'returns',
-                'player_x', 'player_y', 'ball_x', 'ball_y', 'done'])
+                'player_x', 'player_y', 'ball_x', 'ball_y', 'done',
+                'ball_direction', 'target_x', 'target_y'])
             writer.writeheader()
             for step in range(args.steps):
                 video.append_data(env.render())
                 action, _ = model.predict(obs, deterministic=not args.stochastic)
                 obs, reward, terminated, truncated, info = env.step(int(action))
                 state = info['tennis_state']
+                target = info['target']
                 writer.writerow(dict(
                     step=step + 1, requested=names[info['requested_action']],
                     executed=names[info['executed_action']], auto_serve=info['auto_serve'],
                     side=info['side_before'], raw=reward, returns=info['return_count'],
                     player_x=state['player_x'], player_y=state['player_y'],
-                    ball_x=state['ball_x'], ball_y=state['ball_y'], done=terminated or truncated))
+                    ball_x=state['ball_x'], ball_y=state['ball_y'], done=terminated or truncated,
+                    ball_direction=info['ball_direction'],
+                    target_x=target[0] if target is not None else None,
+                    target_y=target[1] if target is not None else None))
                 if terminated or truncated:
                     obs, _ = env.reset()
     finally:
@@ -324,6 +333,7 @@ def play(args):
     write_json(args.video.with_suffix('.config.json'), dict(
         model=str(args.model.resolve()), auto_serve=settings['auto_serve'],
         observation='ram', serve_mode=settings.get('serve_mode', 'fire'),
+        target_mode=settings.get('target_mode', 'intercept'),
         seed=args.seed, stochastic=args.stochastic, fps=15, steps=args.steps))
     print(f'Video: {args.video.resolve()}\nActions: {log.resolve()}', flush=True)
 
@@ -346,8 +356,9 @@ def main():
     p.add_argument('--batch-size', type=positive, default=256)
     p.add_argument('--auto-serve', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--serve-mode', choices=['fire', 'align_x_fire'], default='align_x_fire')
+    p.add_argument('--target-mode', choices=TARGET_MODES, default='recover_chase')
     p.add_argument('--gamma', type=float, default=0.99)
-    p.add_argument('--beta', type=float, default=0.0)
+    p.add_argument('--beta', type=float, default=0.05)
     p.add_argument('--learning-rate', type=float, default=1e-4)
     p.add_argument('--eval-freq', type=positive, default=50000)
     p.add_argument('--eval-episodes', type=positive, default=5)

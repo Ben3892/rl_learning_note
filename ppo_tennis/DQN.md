@@ -1,5 +1,8 @@
 # 带经验回放的 Q-learning：DQN Tennis
 
+新增：[RAM DQN 对照实验](DQN_RAM.md)，与 RAM PPO 共用状态、回中／追球奖励、自动发球和固定种子评估。
+
+
 入口为 [dqn_tennis.py](dqn_tennis.py)，与 PPO 共用依赖、环境和辅助奖励。
 图像状态无法方便地存成 Q 表，因此用 CNN 近似 `Q(s,a)`；这就是 Deep Q-learning。
 使用 SB3 的 vanilla DQN 实现，包含均匀经验回放、目标网络和梯度裁剪，

@@ -32,9 +32,40 @@ def ball_velocity(previous, current, raw_reward=0.0, terminated=False):
     return (float(dx), float(dy)) if abs(dx) <= 32 and abs(dy) <= 32 else (0.0, 0.0)
 
 
-def target_and_potential(state, dx, dy):
-    target = receiving_target(state, dx / FRAME_SKIP, dy / FRAME_SKIP) if (
-        state.valid and state.rally and dy != 0) else None
+# Empirical player-foot movement ranges for this Tennis ROM.
+OWN_Y_BOUNDS = ((47.0, 98.0), (120.0, 187.0))
+TARGET_MODES = ('intercept', 'recover_chase')
+
+
+def flight_phase(state, dy):
+    """Screen y increases downwards; the incoming sign reverses on a side switch."""
+    if (state.side not in (0, 1) or not state.valid or not state.rally
+            or state.waiting or not math.isfinite(dy) or dy == 0):
+        return 'unknown'
+    toward_player = -1 if state.side == 0 else 1
+    return 'incoming' if dy * toward_player > 0 else 'outgoing'
+
+
+def movement_target(state, dx, dy, target_mode='intercept'):
+    if target_mode not in TARGET_MODES:
+        raise ValueError(f'Unknown target_mode: {target_mode}')
+    phase = flight_phase(state, dy)
+    if phase == 'unknown':
+        return None
+    if target_mode == 'intercept':
+        return receiving_target(state, dx / FRAME_SKIP, dy / FRAME_SKIP)
+    low_y, high_y = OWN_Y_BOUNDS[state.side]
+    if phase == 'outgoing':
+        # Return to the center of our own half, never the center/net of the full court.
+        return 80.0, (low_y + high_y) / 2
+    # Follow the ball's ground/shadow position, not its airborne sprite.
+    # While the ball is still on the opponent's side, do not target that half.
+    return (float(np.clip(state.ball_x, 20.0, 148.0)),
+            float(np.clip(state.ball_y, low_y, high_y)))
+
+
+def target_and_potential(state, dx, dy, target_mode='intercept'):
+    target = movement_target(state, dx, dy, target_mode)
     if target is None:
         return None, 0.0
     distance = math.hypot(state.player_x - target[0], state.player_y - target[1])
@@ -72,11 +103,15 @@ def encode_observation(ram, state, dx, dy, target, last_action):
 class RAMControlEnv(gym.Wrapper):
     """Raw rewards and engineered RAM state; auto-serve changes the task explicitly."""
 
-    def __init__(self, env, tracker, auto_serve=True, serve_mode='align_x_fire'):
+    def __init__(self, env, tracker, auto_serve=True, serve_mode='align_x_fire',
+                 target_mode='intercept'):
         super().__init__(env)
         self.tracker = tracker
         self.auto_serve = auto_serve
         self.serve_mode = serve_mode
+        if target_mode not in TARGET_MODES:
+            raise ValueError(f'Unknown target_mode: {target_mode}')
+        self.target_mode = target_mode
         self.action_names = self.unwrapped.get_action_meanings()
         if len(self.action_names) != 18:
             raise ValueError('This RAM experiment expects the 18-action Tennis ROM.')
@@ -84,7 +119,7 @@ class RAMControlEnv(gym.Wrapper):
         self.observation_space = gym.spaces.Box(-1, 1, shape=(OBS_SIZE,), dtype=np.float32)
 
     def observation(self, state, dx=0.0, dy=0.0):
-        target, potential = target_and_potential(state, dx, dy)
+        target, potential = target_and_potential(state, dx, dy, self.target_mode)
         observation = encode_observation(
             self.unwrapped.ale.getRAM(), state, dx, dy, target, self.last_action)
         return observation, target, potential
@@ -94,7 +129,7 @@ class RAMControlEnv(gym.Wrapper):
         self.tracker.signals.reset(self.tracker.state)
         self.last_action = 0
         obs, target, potential = self.observation(self.tracker.state)
-        info.update(tennis_state=asdict(self.tracker.state), potential=potential, target=target)
+        info.update(tennis_state=asdict(self.tracker.state), potential=potential, target=target, ball_direction='unknown')
         return obs, info
 
     def step(self, action):
@@ -111,6 +146,7 @@ class RAMControlEnv(gym.Wrapper):
         info.update(
             tennis_state=asdict(current), side_before=previous.side,
             potential=potential, target=target, velocity=(dx, dy),
+            ball_direction=flight_phase(current, dy),
             requested_action=requested, executed_action=executed, auto_serve=forced,
             return_count=int(self.tracker.signals.totals['return_count'] - before_returns),
             player_moved=bool(previous.side == current.side and (
@@ -149,7 +185,7 @@ class PotentialReward(gym.Wrapper):
 
 def make_ram_env(seed=None, auto_serve=True, shaping=False, gamma=0.99, beta=0.05,
                  max_steps=None, idle_limit=None, monitor_file=None, render_mode=None,
-                 serve_mode='align_x_fire'):
+                 serve_mode='align_x_fire', target_mode='intercept'):
     base = gym.make('ALE/Tennis-v5', obs_type='ram', frameskip=1,
                     repeat_action_probability=0.25, max_episode_steps=108000,
                     render_mode=render_mode)
@@ -157,7 +193,8 @@ def make_ram_env(seed=None, auto_serve=True, shaping=False, gamma=0.99, beta=0.0
     tracker = TennisRAMTracker(base, RewardConfig(
         return_bonus=0.0, position_weight=0.0, tracking_penalty=0.0, idle_penalty=0.0))
     env = FireResetEnv(MaxAndSkipEnv(NoopResetEnv(tracker, noop_max=30), skip=FRAME_SKIP))
-    env = RAMControlEnv(env, tracker, auto_serve=auto_serve, serve_mode=serve_mode)
+    env = RAMControlEnv(env, tracker, auto_serve=auto_serve, serve_mode=serve_mode,
+                        target_mode=target_mode)
     if max_steps is not None or idle_limit is not None:
         env = EvaluationLimits(env, tracker, max_steps=max_steps, idle_limit=idle_limit)
     env = Monitor(env, filename=monitor_file)
